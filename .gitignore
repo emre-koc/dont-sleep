@@ -1,0 +1,5 @@
+.build/
+DontSleep.app/
+dist/
+DontSleep.zip
+.DS_Store
