@@ -143,3 +143,7 @@ Tools/AppIcon/main.swift  Renders the app icon from EyeIcon.swift
 Info.plist                Bundle settings (menu bar only, no Dock icon)
 build.sh                  Dev and release builds
 ```
+
+## License
+
+[MIT](LICENSE) © 2026 Emre Koc
