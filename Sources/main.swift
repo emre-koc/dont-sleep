@@ -1,4 +1,5 @@
 import AppKit
+import IOKit.hid
 import IOKit.ps
 import IOKit.pwr_mgt
 import ServiceManagement
@@ -39,8 +40,17 @@ final class PowerManager {
         run("/usr/bin/sudo", ["-n", "/usr/bin/pmset", "-a", "disablesleep", awake ? "1" : "0"]).status == 0
     }
 
+    /// Puts the Mac to sleep right away. Restoring normal sleep alone isn't enough when the lid
+    /// is already closed: macOS only sleeps at the moment the lid closes, and other apps' idle
+    /// assertions can keep it awake indefinitely.
+    func sleepNow() {
+        if run("/usr/bin/pmset", ["sleepnow"]).status != 0 {
+            _ = run("/usr/bin/sudo", ["-n", "/usr/bin/pmset", "sleepnow"])
+        }
+    }
+
     private func installSudoersRule() -> Bool {
-        let rule = "\(NSUserName()) ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 0, /usr/bin/pmset -a disablesleep 1"
+        let rule = "\(NSUserName()) ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 0, /usr/bin/pmset -a disablesleep 1, /usr/bin/pmset sleepnow"
         let shell = """
         mkdir -p /etc/sudoers.d && T=$(mktemp /etc/sudoers.d/.dont-sleep.XXXXXX) && \
         printf '%s\\n' '\(rule)' > "$T" && /usr/sbin/visudo -cf "$T" >/dev/null && \
@@ -102,6 +112,29 @@ func batteryPercentOnBattery() -> Int? {
     return nil
 }
 
+/// Battery pack temperature in °C, from the AppleSmartBattery driver (works on Intel and Apple Silicon).
+func batteryTemperature() -> Double? {
+    let service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AppleSmartBattery"))
+    guard service != 0 else { return nil }
+    defer { IOObjectRelease(service) }
+    guard let raw = IORegistryEntryCreateCFProperty(service, "Temperature" as CFString, kCFAllocatorDefault, 0)?
+        .takeRetainedValue() as? Int, raw > 0 else { return nil }
+    return Double(raw) / 100
+}
+
+/// True when the lid is closed and no external display is in use, i.e. the Mac is in a bag rather
+/// than running closed on a desk with a monitor.
+func isClosedWithoutDisplay() -> Bool {
+    let root = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("IOPMrootDomain"))
+    guard root != 0 else { return false }
+    defer { IOObjectRelease(root) }
+    let closed = IORegistryEntryCreateCFProperty(root, "AppleClamshellState" as CFString, kCFAllocatorDefault, 0)?
+        .takeRetainedValue() as? Bool ?? false
+    var displays: UInt32 = 0
+    CGGetActiveDisplayList(0, nil, &displays)
+    return closed && displays == 0
+}
+
 // MARK: - Settings
 
 final class Settings {
@@ -111,9 +144,16 @@ final class Settings {
     private init() {
         defaults.register(defaults: [
             "heatGuard": true, "heatLimit": 85.0, "pressureGuard": true,
-            "batteryGuard": true, "batteryLimit": 10,
+            "batteryGuard": true, "batteryLimit": 25,
+            "batteryHeatGuard": true, "batteryHeatLimit": 40.0,
+            "uprightGuard": true, "uprightMinutes": 15,
             "eyesLookAway": true,
         ])
+        // v1.2 raised the low-battery default from 10 % to 25 %; move anyone still on the old default.
+        if defaults.integer(forKey: "settingsVersion") < 2 {
+            if defaults.object(forKey: "batteryLimit") as? Int == 10 { defaults.removeObject(forKey: "batteryLimit") }
+            defaults.set(2, forKey: "settingsVersion")
+        }
     }
 
     var heatGuard: Bool {
@@ -142,6 +182,24 @@ final class Settings {
     var batteryLimit: Int {
         get { defaults.integer(forKey: "batteryLimit") }
         set { defaults.set(newValue, forKey: "batteryLimit") }
+    }
+    var batteryHeatGuard: Bool {
+        get { defaults.bool(forKey: "batteryHeatGuard") }
+        set { defaults.set(newValue, forKey: "batteryHeatGuard") }
+    }
+    /// Battery temperature (°C) above which the eyes close.
+    var batteryHeatLimit: Double {
+        get { defaults.double(forKey: "batteryHeatLimit") }
+        set { defaults.set(newValue, forKey: "batteryHeatLimit") }
+    }
+    /// Sleep when the closed Mac has been standing on its side (as in a bag) for a while.
+    var uprightGuard: Bool {
+        get { defaults.bool(forKey: "uprightGuard") }
+        set { defaults.set(newValue, forKey: "uprightGuard") }
+    }
+    var uprightMinutes: Int {
+        get { defaults.integer(forKey: "uprightMinutes") }
+        set { defaults.set(newValue, forKey: "uprightMinutes") }
     }
 }
 
@@ -222,13 +280,117 @@ final class ThermalMonitor {
     }
 }
 
+// MARK: - Motion
+
+/// Reads the built-in accelerometer. Apple Silicon MacBooks expose it as an SPU HID device
+/// (usage page 0xFF00, usage 3); each 22-byte report holds x, y, z as Int32 in 1/65536 g at
+/// offsets 6, 10 and 14. No special permission is needed. The sensor is only powered while
+/// something has acquired it.
+final class MotionMonitor {
+    private static let usagePage = 0xff00, usage = 3
+    private static let reportInterval = 1_000_000 // µs: one report per second is plenty
+
+    private var manager: IOHIDManager?
+    private let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: 64)
+    private var users = 0
+    private var gravity: (x: Double, y: Double, z: Double)?
+    private var lastReport = Date.distantPast
+
+    var isAvailable: Bool { !drivers().isEmpty }
+
+    /// Degrees away from lying flat: 0 when flat on a table, 90 when standing on an edge.
+    /// Nil when there's no fresh reading or the Mac is being moved around.
+    var tilt: Double? {
+        guard let g = gravity, Date().timeIntervalSince(lastReport) < 5 else { return nil }
+        let magnitude = (g.x * g.x + g.y * g.y + g.z * g.z).squareRoot()
+        guard magnitude > 0.7, magnitude < 1.3 else { return nil }
+        return acos(min(1, abs(g.z) / magnitude)) * 180 / .pi
+    }
+
+    func acquire() {
+        users += 1
+        if users == 1 { start() }
+    }
+
+    func release() {
+        guard users > 0 else { return }
+        users -= 1
+        if users == 0 { stop() }
+    }
+
+    private func drivers() -> [io_service_t] {
+        var iterator: io_iterator_t = 0
+        guard IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("AppleSPUHIDDriver"),
+                                           &iterator) == KERN_SUCCESS else { return [] }
+        defer { IOObjectRelease(iterator) }
+        var found: [io_service_t] = []
+        while case let service = IOIteratorNext(iterator), service != 0 {
+            let page = IORegistryEntryCreateCFProperty(service, "PrimaryUsagePage" as CFString, nil, 0)?
+                .takeRetainedValue() as? Int
+            let usage = IORegistryEntryCreateCFProperty(service, "PrimaryUsage" as CFString, nil, 0)?
+                .takeRetainedValue() as? Int
+            if page == Self.usagePage, usage == Self.usage { found.append(service) } else { IOObjectRelease(service) }
+        }
+        return found
+    }
+
+    private func configureDrivers(on: Bool) {
+        for driver in drivers() {
+            IORegistryEntrySetCFProperty(driver, "SensorPropertyReportingState" as CFString, (on ? 1 : 0) as CFNumber)
+            IORegistryEntrySetCFProperty(driver, "SensorPropertyPowerState" as CFString, (on ? 1 : 0) as CFNumber)
+            IORegistryEntrySetCFProperty(driver, "ReportInterval" as CFString,
+                                         (on ? Self.reportInterval : 0) as CFNumber)
+            IOObjectRelease(driver)
+        }
+    }
+
+    private func start() {
+        configureDrivers(on: true)
+        let manager = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
+        IOHIDManagerSetDeviceMatching(manager, [kIOHIDPrimaryUsagePageKey: Self.usagePage,
+                                                kIOHIDPrimaryUsageKey: Self.usage] as CFDictionary)
+        guard IOHIDManagerOpen(manager, IOOptionBits(kIOHIDOptionsTypeNone)) == kIOReturnSuccess else { return }
+        let context = Unmanaged.passUnretained(self).toOpaque()
+        for device in IOHIDManagerCopyDevices(manager) as? Set<IOHIDDevice> ?? [] {
+            IOHIDDeviceRegisterInputReportCallback(device, buffer, 64, { context, _, _, _, _, report, length in
+                guard let context, length >= 18 else { return }
+                Unmanaged<MotionMonitor>.fromOpaque(context).takeUnretainedValue().handle(report, length)
+            }, context)
+        }
+        IOHIDManagerScheduleWithRunLoop(manager, CFRunLoopGetMain(), CFRunLoopMode.commonModes.rawValue)
+        self.manager = manager
+    }
+
+    private func stop() {
+        if let manager {
+            IOHIDManagerUnscheduleFromRunLoop(manager, CFRunLoopGetMain(), CFRunLoopMode.commonModes.rawValue)
+            IOHIDManagerClose(manager, IOOptionBits(kIOHIDOptionsTypeNone))
+        }
+        manager = nil
+        gravity = nil
+        configureDrivers(on: false)
+    }
+
+    private func handle(_ report: UnsafeMutablePointer<UInt8>, _ length: Int) {
+        func axis(_ offset: Int) -> Double {
+            var raw: Int32 = 0
+            memcpy(&raw, report + offset, 4)
+            return Double(Int32(littleEndian: raw)) / 65536
+        }
+        gravity = (axis(6), axis(10), axis(14))
+        lastReport = Date()
+    }
+}
+
 // MARK: - Settings window
 
 final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private let settings = Settings.shared
     private let thermal: ThermalMonitor
+    private let motion: MotionMonitor
     private let onChange: () -> Void
     private var liveTimer: Timer?
+    private var watchingMotion = false
 
     private let heatCheck = NSButton(checkboxWithTitle: "Close eyes when the Mac gets too hot", target: nil, action: nil)
     private let heatSlider = NSSlider(value: 85, minValue: 60, maxValue: 105, target: nil, action: nil)
@@ -239,11 +401,22 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private let eyesCheck = NSButton(checkboxWithTitle: "Open eyes look away from the mouse pointer",
                                      target: nil, action: nil)
     private let batteryCheck = NSButton(checkboxWithTitle: "Close eyes when the battery is low", target: nil, action: nil)
-    private let batterySlider = NSSlider(value: 10, minValue: 5, maxValue: 50, target: nil, action: nil)
+    private let batterySlider = NSSlider(value: 25, minValue: 5, maxValue: 50, target: nil, action: nil)
     private let batteryValue = NSTextField(labelWithString: "")
+    private let batteryHeatCheck = NSButton(checkboxWithTitle: "Close eyes when the battery gets too hot",
+                                            target: nil, action: nil)
+    private let batteryHeatSlider = NSSlider(value: 40, minValue: 30, maxValue: 50, target: nil, action: nil)
+    private let batteryHeatValue = NSTextField(labelWithString: "")
+    private let batteryNow = NSTextField(labelWithString: "")
+    private let uprightCheck = NSButton(checkboxWithTitle: "Sleep when the Mac stands on its side in a bag",
+                                        target: nil, action: nil)
+    private let uprightSlider = NSSlider(value: 15, minValue: 5, maxValue: 60, target: nil, action: nil)
+    private let uprightValue = NSTextField(labelWithString: "")
+    private let positionNow = NSTextField(labelWithString: "")
 
-    init(thermal: ThermalMonitor, onChange: @escaping () -> Void) {
+    init(thermal: ThermalMonitor, motion: MotionMonitor, onChange: @escaping () -> Void) {
         self.thermal = thermal
+        self.motion = motion
         self.onChange = onChange
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 440, height: 10),
                               styleMask: [.titled, .closable], backing: .buffered, defer: false)
@@ -262,6 +435,10 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         updateChipNow()
         liveTimer?.invalidate()
         liveTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in self?.updateChipNow() }
+        if !watchingMotion {
+            motion.acquire()
+            watchingMotion = true
+        }
         window?.center()
         showWindow(nil)
         if #available(macOS 14, *) { NSApp.activate() } else { NSApp.activate(ignoringOtherApps: true) }
@@ -271,24 +448,33 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     func windowWillClose(_ notification: Notification) {
         liveTimer?.invalidate()
         liveTimer = nil
+        if watchingMotion {
+            motion.release()
+            watchingMotion = false
+        }
     }
 
     private func buildContent() {
-        for control in [eyesCheck, heatCheck, heatSlider, pressureCheck, batteryCheck, batterySlider] as [NSControl] {
+        for control in [eyesCheck, heatCheck, heatSlider, pressureCheck, batteryCheck, batterySlider,
+                        batteryHeatCheck, batteryHeatSlider, uprightCheck, uprightSlider] as [NSControl] {
             control.target = self
             control.action = #selector(changed)
         }
         heatSlider.numberOfTickMarks = 10
         batterySlider.numberOfTickMarks = 10
-        for slider in [heatSlider, batterySlider] {
+        batteryHeatSlider.numberOfTickMarks = 11
+        uprightSlider.numberOfTickMarks = 12
+        for slider in [heatSlider, batterySlider, batteryHeatSlider, uprightSlider] {
             slider.isContinuous = true
             slider.widthAnchor.constraint(equalToConstant: 240).isActive = true
         }
-        for label in [heatValue, batteryValue] {
+        for label in [heatValue, batteryValue, batteryHeatValue, uprightValue] {
             label.font = .monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .medium)
             label.widthAnchor.constraint(equalToConstant: 56).isActive = true
         }
         chipNow.textColor = .secondaryLabelColor
+        batteryNow.textColor = .secondaryLabelColor
+        positionNow.textColor = .secondaryLabelColor
 
         func header(_ text: String) -> NSTextField {
             let label = NSTextField(labelWithString: text)
@@ -303,6 +489,13 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             return stack
         }
 
+        let sleepNote = NSTextField(wrappingLabelWithString:
+            "When a limit is reached with the lid closed, the eyes close and the Mac goes to sleep. "
+            + "Standing on its side only counts while the lid is closed and no external display is connected.")
+        sleepNote.textColor = .secondaryLabelColor
+        sleepNote.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        sleepNote.preferredMaxLayoutWidth = 400
+
         let stack = NSStackView(views: [
             header("Eyes"),
             eyesCheck,
@@ -314,12 +507,22 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             header("Battery"),
             batteryCheck,
             row([NSTextField(labelWithString: "Limit"), batterySlider, batteryValue]),
+            batteryHeatCheck,
+            row([NSTextField(labelWithString: "Limit"), batteryHeatSlider, batteryHeatValue]),
+            row([batteryNow]),
+            header("Motion"),
+            uprightCheck,
+            row([NSTextField(labelWithString: "After"), uprightSlider, uprightValue]),
+            row([positionNow]),
+            sleepNote,
         ])
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 10
         stack.setCustomSpacing(18, after: eyesCheck)
         stack.setCustomSpacing(18, after: pressureCheck)
+        stack.setCustomSpacing(18, after: batteryNow.superview ?? batteryNow)
+        stack.setCustomSpacing(18, after: positionNow.superview ?? positionNow)
         stack.edgeInsets = NSEdgeInsets(top: 20, left: 20, bottom: 20, right: 20)
         window?.contentView = stack
     }
@@ -331,6 +534,10 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         pressureCheck.state = settings.pressureGuard ? .on : .off
         batteryCheck.state = settings.batteryGuard ? .on : .off
         batterySlider.integerValue = settings.batteryLimit
+        batteryHeatCheck.state = settings.batteryHeatGuard ? .on : .off
+        batteryHeatSlider.doubleValue = settings.batteryHeatLimit
+        uprightCheck.state = settings.uprightGuard ? .on : .off
+        uprightSlider.integerValue = settings.uprightMinutes
         updateLabels()
     }
 
@@ -341,6 +548,10 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         settings.pressureGuard = pressureCheck.state == .on
         settings.batteryGuard = batteryCheck.state == .on
         settings.batteryLimit = batterySlider.integerValue
+        settings.batteryHeatGuard = batteryHeatCheck.state == .on
+        settings.batteryHeatLimit = batteryHeatSlider.doubleValue.rounded()
+        settings.uprightGuard = uprightCheck.state == .on
+        settings.uprightMinutes = Int(uprightSlider.doubleValue.rounded())
         updateLabels()
         onChange()
     }
@@ -350,6 +561,10 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         batteryValue.stringValue = "\(settings.batteryLimit) %"
         heatSlider.isEnabled = settings.heatGuard && thermal.isAvailable
         batterySlider.isEnabled = settings.batteryGuard
+        batteryHeatValue.stringValue = "\(Int(settings.batteryHeatLimit)) °C"
+        batteryHeatSlider.isEnabled = settings.batteryHeatGuard
+        uprightValue.stringValue = "\(settings.uprightMinutes) min"
+        uprightSlider.isEnabled = settings.uprightGuard && motion.isAvailable
     }
 
     private func updateChipNow() {
@@ -357,6 +572,19 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             chipNow.stringValue = "Chip temperature now: \(Int(temp.rounded())) °C"
         } else {
             chipNow.stringValue = "Chip temperature sensor isn't available on this Mac."
+        }
+        if let temp = batteryTemperature() {
+            batteryNow.stringValue = "Battery temperature now: \(Int(temp.rounded())) °C"
+        } else {
+            batteryNow.stringValue = "Battery temperature isn't available on this Mac."
+        }
+        if !motion.isAvailable {
+            positionNow.stringValue = "This Mac has no motion sensor."
+        } else if let tilt = motion.tilt {
+            let position = tilt >= AppDelegate.uprightTilt ? "standing on its side" : tilt >= 30 ? "tilted" : "lying flat"
+            positionNow.stringValue = "Position now: \(position) (\(Int(tilt.rounded()))° from flat)"
+        } else {
+            positionNow.stringValue = "Position now: reading the motion sensor…"
         }
     }
 }
@@ -433,12 +661,20 @@ final class EyeTracker {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private let power = PowerManager()
     private let thermal = ThermalMonitor()
+    private let motion = MotionMonitor()
+    /// Degrees from flat at which the Mac counts as standing on its side.
+    static let uprightTilt: Double = 60
+    /// When the closed Mac started standing on its side; nil while it isn't.
+    private var uprightSince: Date?
+    private var watchingMotion = false
     private let settings = Settings.shared
     private var statusItem: NSStatusItem!
     private var awake = false
     /// Why the app closed the eyes on its own, shown in the menu until the user reopens them.
     private var autoCloseReason: String?
     private var safetyTimer: Timer?
+    /// Keeps App Nap from delaying the safety checks while the Mac is kept awake.
+    private var activity: NSObjectProtocol?
     private var sigterm: DispatchSourceSignal?
     private lazy var tracker = EyeTracker(
         iconCenter: { [weak self] in
@@ -448,7 +684,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         draw: { [weak self] look in
             self?.statusItem.button?.image = EyeIcon.make(open: true, look: look)
         })
-    private lazy var settingsWindow = SettingsWindowController(thermal: thermal) { [weak self] in
+    private lazy var settingsWindow = SettingsWindowController(thermal: thermal, motion: motion) { [weak self] in
         self?.checkSafety()
         self?.refresh()
     }
@@ -541,20 +777,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 return "macOS reports heavy thermal pressure"
             }
         }
+        if settings.batteryHeatGuard, let temp = batteryTemperature(), temp >= settings.batteryHeatLimit {
+            return "The battery is at \(Int(temp.rounded())) °C, above your \(Int(settings.batteryHeatLimit)) °C limit"
+        }
         if settings.batteryGuard, let pct = batteryPercentOnBattery(), pct <= settings.batteryLimit {
             return "The battery is at \(pct) %, at or below your \(settings.batteryLimit) % limit"
         }
         return nil
     }
 
+    /// Set once the closed Mac has stood on its side for the configured time.
+    private func uprightReason() -> String? {
+        guard awake, settings.uprightGuard, let tilt = motion.tilt, tilt >= Self.uprightTilt,
+              isClosedWithoutDisplay() else {
+            uprightSince = nil
+            return nil
+        }
+        let since = uprightSince ?? Date()
+        uprightSince = since
+        let minutes = settings.uprightMinutes
+        guard Date().timeIntervalSince(since) >= Double(minutes) * 60 else { return nil }
+        return "The Mac has been standing on its side with the lid closed for \(minutes) min"
+    }
+
     private func checkSafety() {
         // Sample even while asleep-allowed so the average is warm when the eyes open.
         let temp = thermal.sample()
-        guard awake, let reason = blockReason(temperature: temp) else { return }
+        guard awake, let reason = blockReason(temperature: temp) ?? uprightReason() else { return }
         if power.setAwake(false) {
             awake = false
             autoCloseReason = reason
             refresh()
+            if isClosedWithoutDisplay() { power.sleepNow() }
         }
     }
 
@@ -564,6 +818,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             ? EyeIcon.make(open: true, look: tracking ? tracker.look : EyeIcon.defaultLook)
             : EyeIcon.make(open: false)
         tracking ? tracker.start() : tracker.stop()
+        let needsMotion = awake && settings.uprightGuard
+        if needsMotion != watchingMotion {
+            needsMotion ? motion.acquire() : motion.release()
+            watchingMotion = needsMotion
+            uprightSince = nil
+        }
+        if awake, activity == nil {
+            activity = ProcessInfo.processInfo.beginActivity(
+                options: .userInitiatedAllowingIdleSystemSleep,
+                reason: "Watching temperature and battery while the Mac is kept awake")
+        } else if !awake, let current = activity {
+            ProcessInfo.processInfo.endActivity(current)
+            activity = nil
+        }
         statusItem.button?.toolTip = awake
             ? "Eyes open: Mac stays awake, even with the lid closed"
             : autoCloseReason.map { "Eyes closed automatically: \($0)" } ?? "Eyes closed: normal sleep"
@@ -579,6 +847,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         info(awake ? "Awake: lid-close sleep disabled" : "Normal sleep")
         if !awake, let reason = autoCloseReason { info("Closed automatically: \(reason)") }
         if let temp = thermal.current() { info("Chip: \(Int(temp.rounded())) °C") }
+        if let temp = batteryTemperature() { info("Battery: \(Int(temp.rounded())) °C") }
         menu.addItem(.separator())
 
         let toggleItem = NSMenuItem(title: awake ? "Close Eyes (allow sleep)" : "Open Eyes (stay awake)",

@@ -55,16 +55,22 @@ automatically (back to normal sleep) when:
 |---|---|---|
 | 🌡️ **Chip too hot**: average of the last 3 readings, taken every 15 s | 85 °C | 60–105 °C |
 | 🔥 **macOS reports heavy thermal pressure** | On | On / Off |
-| 🔋 **Battery low** (on battery only) | 10 % | 5–50 % |
+| 🔋 **Battery low** (on battery only) | 25 % | 5–50 % |
+| 🌡️ **Battery too hot** | 40 °C | 30–50 °C |
+| 🎒 **Standing on its side in a bag**: lid closed, no external display, read from the built-in accelerometer | 15 min | 5–60 min |
 
-All three are in **Settings…** (right-click → Settings, or ⌘,), which also shows the live chip
-temperature. When a guard trips, the menu tells you why, and the app won't reopen the eyes until the Mac
+All of these are in **Settings…** (right-click → Settings, or ⌘,), which also shows the live chip
+and battery temperatures. When a guard trips, the menu tells you why, and the app won't reopen the eyes until the Mac
 is back within the limits.
+
+If a guard trips while the lid is closed and no external display is connected (say, in a bag), DontSleep
+also puts the Mac to sleep right away. Restoring normal sleep alone wouldn't do it: macOS only sleeps at
+the moment the lid closes, and other apps can keep an idle Mac awake.
 
 Quitting, logging out or shutting down always restores normal sleep.
 
-> **Intel Macs:** the chip temperature sensor isn't available, so only the thermal-pressure and battery
-> guards apply.
+> **Intel Macs:** the chip temperature sensor and the accelerometer aren't available, so only the
+> thermal-pressure and battery guards apply.
 
 ## Permissions
 
