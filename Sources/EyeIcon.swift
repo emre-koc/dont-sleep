@@ -7,7 +7,11 @@ enum EyeIcon {
     // and scaled to menu bar height.
     private static let menuHeight: CGFloat = 18
 
-    static func make(open: Bool) -> NSImage {
+    /// Where the pupils look, in a unit circle with y pointing down: (1, 0) is hard right.
+    /// The default matches the reference artwork.
+    static let defaultLook = CGVector(dx: 1, dy: 0.17)
+
+    static func make(open: Bool, look: CGVector = defaultLook) -> NSImage {
         let bounds = open
             ? NSRect(x: 280, y: 240, width: 975, height: 585)
             : NSRect(x: 280, y: 220, width: 975, height: 590)
@@ -19,7 +23,7 @@ enum EyeIcon {
             t.translateX(by: -bounds.minX, yBy: -bounds.minY)
             t.concat()
             NSColor.black.set()
-            open ? drawOpen() : drawClosed()
+            open ? drawOpen(look: look) : drawClosed()
             return true
         }
         image.isTemplate = true
@@ -30,27 +34,41 @@ enum EyeIcon {
         NSBezierPath(ovalIn: NSRect(x: cx - rx, y: cy - ry, width: rx * 2, height: ry * 2))
     }
 
-    private static func drawOpen() {
+    private static func drawOpen(look: CGVector) {
+        // Clamp to the unit circle, then map onto how far a pupil can travel inside the ring.
+        let length = max(1, hypot(look.dx, look.dy))
+        let ux = look.dx / length, uy = look.dy / length
+        let offsetX = ux * 92
+        let offsetY = uy * 120
+        // The highlight rides on the pupil's edge facing the look direction, a little above
+        // centre, as in the artwork (where it sits upper right while looking right).
+        let glintX = ux * 63
+        let glintY = min(70, max(-70, uy * 63 - 45))
+        let glintTilt = -18 * ux
+
         for cx in [520.0, 1012.0] as [CGFloat] {
             let cy: CGFloat = 532
             let ring = ellipse(cx, cy, 206, 260)
             ring.lineWidth = 52
             ring.stroke()
 
-            // Pupil, looking right; it merges into the ring on that side.
+            // Pupil; at full deflection it merges into the ring, as in the artwork.
+            let px = cx + offsetX, py = cy + offsetY
+            let pupil = ellipse(px, py, 92, 110)
             NSGraphicsContext.saveGraphicsState()
             ellipse(cx, cy, 232, 286).addClip()
-            ellipse(cx + 92, cy + 20, 92, 110).fill()
+            pupil.fill()
             NSGraphicsContext.restoreGraphicsState()
 
             // Highlight punched out of the pupil.
+            NSGraphicsContext.saveGraphicsState()
+            pupil.addClip()
             NSGraphicsContext.current?.compositingOperation = .clear
             let glint = ellipse(0, 0, 21, 34)
-            let rot = AffineTransform(rotationByDegrees: -18)
-            glint.transform(using: rot)
-            glint.transform(using: AffineTransform(translationByX: cx + 155, byY: cy - 15))
+            glint.transform(using: AffineTransform(rotationByDegrees: glintTilt))
+            glint.transform(using: AffineTransform(translationByX: px + glintX, byY: py + glintY))
             glint.fill()
-            NSGraphicsContext.current?.compositingOperation = .sourceOver
+            NSGraphicsContext.restoreGraphicsState()
         }
     }
 

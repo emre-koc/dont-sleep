@@ -112,6 +112,7 @@ final class Settings {
         defaults.register(defaults: [
             "heatGuard": true, "heatLimit": 85.0, "pressureGuard": true,
             "batteryGuard": true, "batteryLimit": 10,
+            "eyesLookAway": true,
         ])
     }
 
@@ -128,6 +129,11 @@ final class Settings {
     var pressureGuard: Bool {
         get { defaults.bool(forKey: "pressureGuard") }
         set { defaults.set(newValue, forKey: "pressureGuard") }
+    }
+    /// Open eyes look away from the mouse pointer.
+    var eyesLookAway: Bool {
+        get { defaults.bool(forKey: "eyesLookAway") }
+        set { defaults.set(newValue, forKey: "eyesLookAway") }
     }
     var batteryGuard: Bool {
         get { defaults.bool(forKey: "batteryGuard") }
@@ -230,6 +236,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private let chipNow = NSTextField(labelWithString: "")
     private let pressureCheck = NSButton(checkboxWithTitle: "Also close eyes when macOS reports heavy thermal pressure",
                                          target: nil, action: nil)
+    private let eyesCheck = NSButton(checkboxWithTitle: "Open eyes look away from the mouse pointer",
+                                     target: nil, action: nil)
     private let batteryCheck = NSButton(checkboxWithTitle: "Close eyes when the battery is low", target: nil, action: nil)
     private let batterySlider = NSSlider(value: 10, minValue: 5, maxValue: 50, target: nil, action: nil)
     private let batteryValue = NSTextField(labelWithString: "")
@@ -266,7 +274,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     }
 
     private func buildContent() {
-        for control in [heatCheck, heatSlider, pressureCheck, batteryCheck, batterySlider] as [NSControl] {
+        for control in [eyesCheck, heatCheck, heatSlider, pressureCheck, batteryCheck, batterySlider] as [NSControl] {
             control.target = self
             control.action = #selector(changed)
         }
@@ -296,6 +304,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         }
 
         let stack = NSStackView(views: [
+            header("Eyes"),
+            eyesCheck,
             header("Heat"),
             heatCheck,
             row([NSTextField(labelWithString: "Limit"), heatSlider, heatValue]),
@@ -308,12 +318,14 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 10
+        stack.setCustomSpacing(18, after: eyesCheck)
         stack.setCustomSpacing(18, after: pressureCheck)
         stack.edgeInsets = NSEdgeInsets(top: 20, left: 20, bottom: 20, right: 20)
         window?.contentView = stack
     }
 
     private func load() {
+        eyesCheck.state = settings.eyesLookAway ? .on : .off
         heatCheck.state = settings.heatGuard ? .on : .off
         heatSlider.doubleValue = settings.heatLimit
         pressureCheck.state = settings.pressureGuard ? .on : .off
@@ -323,6 +335,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     }
 
     @objc private func changed() {
+        settings.eyesLookAway = eyesCheck.state == .on
         settings.heatGuard = heatCheck.state == .on
         settings.heatLimit = heatSlider.doubleValue.rounded()
         settings.pressureGuard = pressureCheck.state == .on
@@ -348,6 +361,73 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     }
 }
 
+// MARK: - Eye tracking
+
+/// Moves the pupils so they look away from the mouse pointer, easing toward each new direction.
+/// Mouse-move monitoring needs no special permission (unlike key events).
+final class EyeTracker {
+    private let iconCenter: () -> NSPoint?
+    private let draw: (CGVector) -> Void
+    private var monitors: [Any] = []
+    private var timer: Timer?
+    private var target = EyeIcon.defaultLook
+    private(set) var look = EyeIcon.defaultLook
+    /// Distance (pt) from the icon at which the pupils reach full deflection.
+    private let fullDeflection: CGFloat = 120
+
+    init(iconCenter: @escaping () -> NSPoint?, draw: @escaping (CGVector) -> Void) {
+        self.iconCenter = iconCenter
+        self.draw = draw
+    }
+
+    func start() {
+        guard monitors.isEmpty else { return }
+        let mask: NSEvent.EventTypeMask = [.mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged]
+        if let global = NSEvent.addGlobalMonitorForEvents(matching: mask, handler: { [weak self] _ in
+            self?.pointerMoved()
+        }) { monitors.append(global) }
+        if let local = NSEvent.addLocalMonitorForEvents(matching: mask, handler: { [weak self] event in
+            self?.pointerMoved()
+            return event
+        }) { monitors.append(local) }
+        pointerMoved()
+    }
+
+    func stop() {
+        monitors.forEach(NSEvent.removeMonitor)
+        monitors = []
+        timer?.invalidate()
+        timer = nil
+    }
+
+    private func pointerMoved() {
+        guard let center = iconCenter() else { return }
+        let mouse = NSEvent.mouseLocation
+        let dx = mouse.x - center.x, dy = mouse.y - center.y
+        let distance = hypot(dx, dy)
+        guard distance > 1 else { return }
+        // Opposite of the icon→mouse vector. Screen y points up and icon y points down,
+        // so x flips sign and y keeps it.
+        let strength = min(1, distance / fullDeflection)
+        target = CGVector(dx: -dx / distance * strength, dy: dy / distance * strength)
+        guard timer == nil else { return }
+        let timer = Timer(timeInterval: 1.0 / 60, repeats: true) { [weak self] _ in self?.step() }
+        RunLoop.main.add(timer, forMode: .common)
+        self.timer = timer
+    }
+
+    private func step() {
+        look.dx += (target.dx - look.dx) * 0.25
+        look.dy += (target.dy - look.dy) * 0.25
+        if hypot(target.dx - look.dx, target.dy - look.dy) < 0.01 {
+            look = target
+            timer?.invalidate()
+            timer = nil
+        }
+        draw(look)
+    }
+}
+
 // MARK: - App
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -360,8 +440,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var autoCloseReason: String?
     private var safetyTimer: Timer?
     private var sigterm: DispatchSourceSignal?
+    private lazy var tracker = EyeTracker(
+        iconCenter: { [weak self] in
+            guard let frame = self?.statusItem.button?.window?.frame else { return nil }
+            return NSPoint(x: frame.midX, y: frame.midY)
+        },
+        draw: { [weak self] look in
+            self?.statusItem.button?.image = EyeIcon.make(open: true, look: look)
+        })
     private lazy var settingsWindow = SettingsWindowController(thermal: thermal) { [weak self] in
         self?.checkSafety()
+        self?.refresh()
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -470,7 +559,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func refresh() {
-        statusItem.button?.image = EyeIcon.make(open: awake)
+        let tracking = awake && settings.eyesLookAway
+        statusItem.button?.image = awake
+            ? EyeIcon.make(open: true, look: tracking ? tracker.look : EyeIcon.defaultLook)
+            : EyeIcon.make(open: false)
+        tracking ? tracker.start() : tracker.stop()
         statusItem.button?.toolTip = awake
             ? "Eyes open: Mac stays awake, even with the lid closed"
             : autoCloseReason.map { "Eyes closed automatically: \($0)" } ?? "Eyes closed: normal sleep"

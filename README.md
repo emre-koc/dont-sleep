@@ -31,6 +31,7 @@
 
 - **Left-click** the eyes to switch.
 - **Right-click** for the menu: current status, chip temperature, Settings…, Launch at Login, Quit.
+- While awake, the eyes look away from your mouse pointer. You can turn this off in Settings.
 
 `caffeinate` and power assertions can't keep a MacBook awake once the lid closes on battery. DontSleep uses `pmset disablesleep`, which can, and it puts normal sleep back as soon as you close
 the eyes or quit.
